@@ -166,7 +166,16 @@ func parseMetricOptions(c *gin.Context) map[string]interface{} {
 	return opts
 }
 
-// parseTimeRange parses the from/to query parameters into a TimeRange
+// parseTimeRange parses the from/to query parameters into a TimeRange.
+//
+// When `from` is omitted, the default Start mirrors
+// metrics.historical_days so the API window matches what the collector
+// actually has in memory. A previous implementation hard-coded one
+// year, which caused under-reporting on deployments configured with a
+// smaller historical window: the collector dropped PRs outside
+// HistoricalDays + lookback, but the API still asked for a full year,
+// so 270d–365d-old releases were classified as "no linked PRs" and
+// Lead Time was distorted (DORA P2 review).
 func (h *MetricsHandler) parseTimeRange(c *gin.Context) models.TimeRange {
 	var timeRange models.TimeRange
 
@@ -194,9 +203,15 @@ func (h *MetricsHandler) parseTimeRange(c *gin.Context) models.TimeRange {
 		timeRange.End = time.Now()
 	}
 
-	// Default to 1 year ago if start is not specified
+	// Default Start = HistoricalDays back. Falls back to 365 if
+	// HistoricalDays is unset or non-positive (matches the historical
+	// default and the value in config.example.yaml).
 	if timeRange.Start.IsZero() {
-		timeRange.Start = timeRange.End.AddDate(-1, 0, 0)
+		days := 365
+		if h.config != nil && h.config.Metrics.HistoricalDays > 0 {
+			days = h.config.Metrics.HistoricalDays
+		}
+		timeRange.Start = timeRange.End.AddDate(0, 0, -days)
 	}
 
 	return timeRange
