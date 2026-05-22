@@ -203,6 +203,61 @@ func (s *genericStore) ListPullRequestsSince(ctx context.Context, since time.Tim
 	return out, rows.Err()
 }
 
+func (s *genericStore) ListMergedPRsMissingFirstCommit(ctx context.Context, source string, since time.Time, limit int) ([]PullRequest, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	q := rebind(s.d, `
+		SELECT id, source, repo_id, number, title, state,
+		       COALESCE(author_id, '') AS author_id,
+		       COALESCE(author_login, '') AS author_login,
+		       COALESCE(head_branch, '') AS head_branch,
+		       COALESCE(base_branch, '') AS base_branch,
+		       COALESCE(additions, 0) AS additions,
+		       COALESCE(deletions, 0) AS deletions,
+		       COALESCE(changed_files, 0) AS changed_files,
+		       COALESCE(jira_key, '') AS jira_key,
+		       created_at, first_commit_at, first_review_at, first_human_review_at,
+		       merged_at, closed_at, fetched_at
+		FROM pull_requests
+		WHERE source = ?
+		  AND merged_at IS NOT NULL
+		  AND merged_at >= ?
+		  AND first_commit_at IS NULL
+		ORDER BY merged_at DESC
+		LIMIT ?`)
+	rows, err := s.db.QueryContext(ctx, q, source, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list PRs missing first_commit_at (%s since %s): %w",
+			source, since.Format(time.RFC3339), err)
+	}
+	defer rows.Close()
+	out := make([]PullRequest, 0, limit)
+	for rows.Next() {
+		var p PullRequest
+		if err := rows.Scan(
+			&p.ID, &p.Source, &p.RepoID, &p.Number, &p.Title, &p.State,
+			&p.AuthorID, &p.AuthorLogin, &p.HeadBranch, &p.BaseBranch,
+			&p.Additions, &p.Deletions, &p.ChangedFiles, &p.JiraKey,
+			&p.CreatedAt, &p.FirstCommitAt, &p.FirstReviewAt, &p.FirstHumanReviewAt,
+			&p.MergedAt, &p.ClosedAt, &p.FetchedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan PR: %w", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *genericStore) UpdatePRFirstCommitAt(ctx context.Context, id string, firstCommitAt *time.Time) error {
+	q := rebind(s.d, `UPDATE pull_requests SET first_commit_at = ? WHERE id = ?`)
+	_, err := s.db.ExecContext(ctx, q, firstCommitAt, id)
+	if err != nil {
+		return fmt.Errorf("update first_commit_at for %s: %w", id, err)
+	}
+	return nil
+}
+
 func (s *genericStore) UpsertPRReviews(ctx context.Context, reviews []PRReview) error {
 	if len(reviews) == 0 {
 		return nil

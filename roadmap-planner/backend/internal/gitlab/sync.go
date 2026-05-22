@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -178,15 +179,30 @@ func classifyNote(body string) (string, bool) {
 	return "commented", true
 }
 
+// firstCommitBackfillBatch caps how many historical MRs are rehydrated
+// per Sync cycle. See github.firstCommitBackfillBatch for the rationale
+// — same budget reasoning applies: keep the post-0009 catch-up bounded
+// so it never starves the regular incremental sync.
+const firstCommitBackfillBatch = 200
+
 // Sync runs one cycle: expand specs → list MRs updated since the
 // previous run → upsert PRs + notes-as-reviews → write a collection_run.
 //
 // The shape mirrors github.Syncer.Sync — see those comments for first-
-// run vs. incremental behaviour.
+// run vs. incremental behaviour. Sync also runs a bounded backfill of
+// `first_commit_at` for already-merged MRs that the incremental window
+// can never revisit (rows from before migration 0009). Without this the
+// Lead Time calculator under-attributes the Dev stage on upgraded
+// deployments — see backfillFirstCommit.
 func (s *Syncer) Sync(ctx context.Context) error {
 	passBActive := s.MemberInstanceSweep && len(s.AllowedMemberIDs) > 0
 	if len(s.specs) == 0 && !passBActive {
 		return nil
+	}
+
+	// Best-effort: backfill errors must not block the regular sync.
+	if err := s.backfillFirstCommit(ctx); err != nil {
+		s.logger.Warn("first_commit_at backfill failed (continuing with incremental sync)", zap.Error(err))
 	}
 
 	now := s.nowFn()
@@ -641,4 +657,96 @@ func (s *Syncer) resolveProjects(ctx context.Context, now time.Time) ([]Project,
 		}
 	}
 	return out, firstErr
+}
+
+// backfillFirstCommit fetches `first_commit_at` for at most
+// firstCommitBackfillBatch already-merged MRs whose row predates
+// migration 0009. Mirrors github.Syncer.backfillFirstCommit; the only
+// twist is GitLab's commits endpoint needs a numeric project_id while
+// the storage row only carries the namespace path, so we cache
+// path → projectID per cycle to avoid re-resolving the same project
+// for every MR.
+func (s *Syncer) backfillFirstCommit(ctx context.Context) error {
+	since := time.Now().AddDate(0, 0, -s.backfillDays)
+	prs, err := s.store.ListMergedPRsMissingFirstCommit(ctx, "gitlab", since, firstCommitBackfillBatch)
+	if err != nil {
+		return err
+	}
+	if len(prs) == 0 {
+		return nil
+	}
+	s.logger.Info("gitlab backfill first_commit_at",
+		zap.Int("batch", len(prs)),
+		zap.Int("backfill_days", s.backfillDays))
+
+	projectIDCache := make(map[string]int64, len(prs))
+	updated, failed := 0, 0
+	for _, p := range prs {
+		path, iid, ok := parseMRID(p.ID)
+		if !ok {
+			s.logger.Warn("backfill: unparseable MR id (skipping)", zap.String("mr_id", p.ID))
+			failed++
+			continue
+		}
+		// Prefer the stored RepoID — it's already the namespace path
+		// and stays correct even if the MR id changed shape across
+		// migrations. parseMRID is the fallback.
+		if p.RepoID != "" {
+			path = p.RepoID
+		}
+		projectID, ok := projectIDCache[path]
+		if !ok {
+			proj, err := s.client.GetProject(ctx, path)
+			if err != nil {
+				s.logger.Warn("backfill: GetProject failed",
+					zap.String("mr_id", p.ID), zap.String("path", path), zap.Error(err))
+				failed++
+				continue
+			}
+			projectID = proj.ID
+			projectIDCache[path] = projectID
+		}
+		commits, err := s.client.ListMRCommits(ctx, projectID, iid)
+		if err != nil {
+			s.logger.Warn("backfill: ListMRCommits failed",
+				zap.String("mr_id", p.ID), zap.Error(err))
+			failed++
+			continue
+		}
+		var firstCommit *time.Time
+		for _, cm := range commits {
+			d := cm.AuthoredDate
+			if firstCommit == nil || d.Before(*firstCommit) {
+				firstCommit = &d
+			}
+		}
+		if firstCommit == nil {
+			continue
+		}
+		if err := s.store.UpdatePRFirstCommitAt(ctx, p.ID, firstCommit); err != nil {
+			s.logger.Warn("backfill: UpdatePRFirstCommitAt failed",
+				zap.String("mr_id", p.ID), zap.Error(err))
+			failed++
+			continue
+		}
+		updated++
+	}
+	s.logger.Info("gitlab backfill first_commit_at complete",
+		zap.Int("updated", updated), zap.Int("failed", failed))
+	return nil
+}
+
+// parseMRID splits a gitlab MR id of the form "group/sub/proj!iid".
+// The project path may contain any number of "/" segments, so we split
+// on the trailing "!" only. Returns ok=false on any structural mismatch.
+func parseMRID(id string) (path string, iid int, ok bool) {
+	bang := strings.LastIndexByte(id, '!')
+	if bang <= 0 || bang == len(id)-1 {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(id[bang+1:])
+	if err != nil || n <= 0 {
+		return "", 0, false
+	}
+	return id[:bang], n, true
 }

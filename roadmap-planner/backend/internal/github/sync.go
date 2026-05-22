@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -129,15 +130,37 @@ func NewSyncer(client *Client, store storage.Store, repos []RepoConfig, linker L
 	}
 }
 
+// firstCommitBackfillBatch caps how many historical PRs we rehydrate
+// per Sync cycle. Migration 0009 added first_commit_at, but the
+// incremental PR fetch only sees PRs whose `updated_at` lands inside
+// the cycle window — so PRs merged before 0009 keep NULL forever
+// unless we revisit them explicitly. Cap chosen so a 5k-row backlog
+// drains in ≤25 cycles (~2h at the default 5-minute interval) without
+// dominating the API budget against the regular incremental sync.
+const firstCommitBackfillBatch = 200
+
 // Sync pulls PRs updated since the last successful run for each repo,
 // resolves authors against members, attempts epic linking, and persists.
 //
 // Reviews are fetched only for PRs we have not seen before (new) or that
 // merged since the previous sync — this caps the per-cycle review-API
 // fan-out to "new + recently-merged" rather than the entire history.
+//
+// Before the incremental pass, Sync runs a bounded backfill for PRs
+// still missing first_commit_at (DORA Lead Time Dev-stage start). See
+// backfillFirstCommit for the rationale — without it, history ingested
+// before migration 0009 stays C3 in Lead Time and the Dev stage is
+// under-attributed.
 func (s *Syncer) Sync(ctx context.Context) error {
 	if len(s.repos) == 0 {
 		return nil
+	}
+
+	// Best-effort: a backfill failure must not block the regular sync,
+	// which still produces fresh data for everything outside the
+	// post-0009 backlog.
+	if err := s.backfillFirstCommit(ctx); err != nil {
+		s.logger.Warn("first_commit_at backfill failed (continuing with incremental sync)", zap.Error(err))
 	}
 
 	// Resolve OWNER/* specs against the org-repos endpoint before we
@@ -343,4 +366,90 @@ func (s *Syncer) Sync(ctx context.Context) error {
 		zap.Int("reviews", totalReviews),
 		zap.Duration("duration", time.Since(runStart)))
 	return firstErr
+}
+
+// backfillFirstCommit fetches `first_commit_at` for at most
+// firstCommitBackfillBatch already-merged PRs whose row predates
+// migration 0009. The query condition is the state machine: a row
+// stays in the result set until first_commit_at is populated, so
+// running this every cycle is naturally idempotent and converges
+// after a handful of syncs.
+//
+// API errors on individual rows are logged and skipped — leaving the
+// column NULL lets the next cycle retry. Rows where the API returns
+// no commits (e.g. a fork with rewritten squash history) also stay
+// NULL; the Lead Time C3 fallback handles them.
+func (s *Syncer) backfillFirstCommit(ctx context.Context) error {
+	since := time.Now().AddDate(0, 0, -s.backfillDays)
+	prs, err := s.store.ListMergedPRsMissingFirstCommit(ctx, "github", since, firstCommitBackfillBatch)
+	if err != nil {
+		return err
+	}
+	if len(prs) == 0 {
+		return nil
+	}
+	s.logger.Info("github backfill first_commit_at",
+		zap.Int("batch", len(prs)),
+		zap.Int("backfill_days", s.backfillDays))
+
+	updated, failed := 0, 0
+	for _, p := range prs {
+		owner, name, number, ok := parsePRID(p.ID)
+		if !ok {
+			s.logger.Warn("backfill: unparseable PR id (skipping)", zap.String("pr_id", p.ID))
+			failed++
+			continue
+		}
+		commits, err := s.client.ListPRCommits(ctx, owner, name, number)
+		if err != nil {
+			s.logger.Warn("backfill: ListPRCommits failed",
+				zap.String("pr_id", p.ID), zap.Error(err))
+			failed++
+			continue
+		}
+		var firstCommit *time.Time
+		for _, cm := range commits {
+			d := cm.Commit.Author.Date
+			if firstCommit == nil || d.Before(*firstCommit) {
+				firstCommit = &d
+			}
+		}
+		// firstCommit may be nil here — API returned no commits. We
+		// still skip the UPDATE: writing NULL is a no-op, but a single
+		// write call against a 0-commit edge case earns nothing and
+		// keeps the row eligible for one cheap retry per cycle.
+		if firstCommit == nil {
+			continue
+		}
+		if err := s.store.UpdatePRFirstCommitAt(ctx, p.ID, firstCommit); err != nil {
+			s.logger.Warn("backfill: UpdatePRFirstCommitAt failed",
+				zap.String("pr_id", p.ID), zap.Error(err))
+			failed++
+			continue
+		}
+		updated++
+	}
+	s.logger.Info("github backfill first_commit_at complete",
+		zap.Int("updated", updated), zap.Int("failed", failed))
+	return nil
+}
+
+// parsePRID splits a github PR id of the form "owner/name#number".
+// Owner/name may contain dashes, dots, and underscores; number is the
+// integer PR number. Returns ok=false on any structural mismatch.
+func parsePRID(id string) (owner, name string, number int, ok bool) {
+	hash := strings.LastIndexByte(id, '#')
+	if hash <= 0 || hash == len(id)-1 {
+		return "", "", 0, false
+	}
+	fullRepo := id[:hash]
+	slash := strings.IndexByte(fullRepo, '/')
+	if slash <= 0 || slash == len(fullRepo)-1 {
+		return "", "", 0, false
+	}
+	n, err := strconv.Atoi(id[hash+1:])
+	if err != nil || n <= 0 {
+		return "", "", 0, false
+	}
+	return fullRepo[:slash], fullRepo[slash+1:], n, true
 }

@@ -53,6 +53,21 @@ type Store interface {
 	// on or after `since`. Open / closed-without-merge rows are excluded —
 	// the DORA Lead Time calculator only attributes shipped work.
 	ListPullRequestsSince(ctx context.Context, since time.Time) ([]PullRequest, error)
+	// ListMergedPRsMissingFirstCommit returns up to `limit` merged PRs
+	// for the given source that still have first_commit_at IS NULL and
+	// merged on or after `since`. Drives the post-0009 backfill: rows
+	// ingested before migration 0009 (or by an older syncer build) keep
+	// NULL first_commit_at until a later sync touches them, which the
+	// incremental PR fetch can never do for already-merged history.
+	// Without backfill those rows fall to Lead Time C3 (no Dev stage),
+	// distorting the metric on deployments upgraded across 0009.
+	// Ordered by merged_at DESC so recent history is rehydrated first.
+	ListMergedPRsMissingFirstCommit(ctx context.Context, source string, since time.Time, limit int) ([]PullRequest, error)
+	// UpdatePRFirstCommitAt writes a single first_commit_at value
+	// without touching any other column. Use for backfill paths — full
+	// UpsertPullRequests would require re-fetching all PR fields just to
+	// move one column.
+	UpdatePRFirstCommitAt(ctx context.Context, id string, firstCommitAt *time.Time) error
 
 	// Members.
 	UpsertMember(ctx context.Context, m Member) error
