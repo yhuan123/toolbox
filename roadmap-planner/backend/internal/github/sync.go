@@ -263,26 +263,27 @@ func (s *Syncer) Sync(ctx context.Context) error {
 				FetchedAt:    runStart,
 			}
 
-			// Reviews + commits — skip the API calls for:
-			//   - drafts (no useful review data; first_commit_at meaningless
-			//     until the PR is opened for review)
+			// Reviews — skip the API call for:
+			//   - drafts (no useful review data)
 			//   - PRs closed without merge >7d ago (rarely accrue new
 			//     reviews, and they dominate the call budget on noisy
 			//     repos during backfill)
-			//
-			// We always fetch reviews + commits for merged PRs in window —
-			// those drive the review-latency rollup and the Lead Time
-			// first_commit_at field (DORA Phase 2).
 			skipPRAPIs := pr.Draft
 			if !skipPRAPIs && pr.MergedAt == nil && pr.ClosedAt != nil &&
 				time.Since(*pr.ClosedAt) > 7*24*time.Hour {
 				skipPRAPIs = true
 			}
-			if !skipPRAPIs {
+			if pr.MergedAt != nil {
 				// Commits → first_commit_at (DORA Lead Time Dev-stage start).
-				// Failures are logged but never block the PR upsert:
-				// COALESCE in UpsertPullRequests preserves any earlier
-				// value, and a later sync retries.
+				// Only merged PRs are read by the Lead Time calculator
+				// (filterPreReleasePRs drops MergedAt==nil), and
+				// ListPullRequestsSince filters merged_at IS NOT NULL —
+				// fetching commits for open / closed-unmerged PRs is
+				// pure API budget burn. Failures are logged but never
+				// block the PR upsert: COALESCE in UpsertPullRequests
+				// preserves any earlier value, and the post-0009
+				// backfill (backfillFirstCommit) catches up on rows
+				// missed by transient errors.
 				commits, err := s.client.ListPRCommits(ctx, repo.Owner, repo.Name, pr.Number)
 				if err != nil {
 					s.logger.Warn("ListPRCommits failed",

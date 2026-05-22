@@ -315,17 +315,22 @@ func (s *Syncer) Sync(ctx context.Context) error {
 				}
 			}
 
-			// Notes → reviews, plus commits → first_commit_at.
-			// Same skip rules as the github side: drop drafts, drop
-			// closed-without-merge older than 7d.
+			// Notes → reviews. Same skip rules as the github side:
+			// drop drafts, drop closed-without-merge older than 7d.
 			skipMRAPIs := mr.Draft || mr.WorkInProg
 			if !skipMRAPIs && mr.MergedAt == nil && mr.ClosedAt != nil &&
 				time.Since(*mr.ClosedAt) > 7*24*time.Hour {
 				skipMRAPIs = true
 			}
-			if !skipMRAPIs {
-				// Commits → first_commit_at (DORA Lead Time Dev-stage start).
-				// Failures are logged but never block the MR upsert.
+			if mr.MergedAt != nil {
+				// Commits → first_commit_at. Only merged MRs are read
+				// by the Lead Time calculator (filterPreReleasePRs
+				// drops MergedAt==nil) and ListPullRequestsSince
+				// filters merged_at IS NOT NULL — fetching commits for
+				// open / closed-unmerged MRs is pure API budget burn,
+				// especially on Pass B sweeps over large GitLab
+				// instances. Failures are logged but never block the
+				// MR upsert; backfillFirstCommit catches up later.
 				commits, err := s.client.ListMRCommits(ctx, p.ID, mr.IID)
 				if err != nil {
 					s.logger.Warn("ListMRCommits failed",
@@ -553,8 +558,10 @@ func (s *Syncer) sweepInstanceByMember(
 				time.Since(*mr.ClosedAt) > 7*24*time.Hour {
 				skipMRAPIs = true
 			}
-			if !skipMRAPIs && mr.ProjectID > 0 {
-				// Commits → first_commit_at (DORA Lead Time Dev-stage start).
+			if mr.MergedAt != nil && mr.ProjectID > 0 {
+				// Commits → first_commit_at. See Pass A comment: only
+				// merged MRs are read by Lead Time, so non-merged MRs
+				// would burn rate budget for data that is discarded.
 				commits, err := s.client.ListMRCommits(ctx, mr.ProjectID, mr.IID)
 				if err != nil {
 					s.logger.Warn("Pass B: ListMRCommits failed",
