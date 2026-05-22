@@ -47,6 +47,15 @@ type Collector struct {
 	issues        []models.EnrichedIssue
 	pullRequests  []models.EnrichedPR
 	lastCollected time.Time
+	// prFetchOK reflects whether the last fetchPullRequests call
+	// succeeded. When false, GetData reports PRStoreAvailable=false so
+	// the Lead Time calculator falls back to the Jira-only path —
+	// otherwise a transient PR query failure would silently produce an
+	// empty PR set, classify every issue as C4, and drop the metric.
+	// Optimistic on startup (no fetch attempted yet); flipped only when
+	// fetchPullRequests actually returns an error against a configured
+	// store.
+	prFetchOK bool
 }
 
 // NewCollector creates a new Jira data collector.
@@ -64,6 +73,7 @@ func NewCollector(jiraClient *jira.Client, store storage.Store, cfg *config.Metr
 		epics:        []models.EnrichedIssue{},
 		issues:       []models.EnrichedIssue{},
 		pullRequests: []models.EnrichedPR{},
+		prFetchOK:    true,
 	}
 }
 
@@ -132,11 +142,17 @@ func (c *Collector) Collect(ctx context.Context) error {
 
 	// Fetch pull requests (for DORA Lead Time Phase 2). Soft-fail if the
 	// store is unavailable or the query errors — Jira-only metrics still
-	// work, only Lead Time stage attribution degrades.
+	// work, only Lead Time stage attribution degrades. Track the failure
+	// so GetData reports PRStoreAvailable=false and the Lead Time
+	// calculator falls back to the Jira-only days output; otherwise the
+	// PR-backed path runs against an empty PR slice and the metric
+	// vanishes entirely.
 	prs, err := c.fetchPullRequests(ctx)
+	prFetchOK := true
 	if err != nil {
-		c.logger.Warn("PR fetch failed; Lead Time stage attribution will be empty", zap.Error(err))
+		c.logger.Warn("PR fetch failed; Lead Time will degrade to Jira-only fallback", zap.Error(err))
 		prs = nil
+		prFetchOK = false
 	}
 
 	// Update cached data
@@ -144,6 +160,7 @@ func (c *Collector) Collect(ctx context.Context) error {
 	c.epics = epics
 	c.issues = issues
 	c.pullRequests = prs
+	c.prFetchOK = prFetchOK
 	c.lastCollected = time.Now()
 	c.mu.Unlock()
 
@@ -444,7 +461,7 @@ func (c *Collector) GetData() (*models.CalculationContext, error) {
 		Epics:            epics,
 		Issues:           issues,
 		PullRequests:     prs,
-		PRStoreAvailable: c.store != nil,
+		PRStoreAvailable: c.store != nil && c.prFetchOK,
 		TimeRange: models.TimeRange{
 			Start: time.Now().AddDate(0, 0, -c.config.HistoricalDays),
 			End:   time.Now(),
