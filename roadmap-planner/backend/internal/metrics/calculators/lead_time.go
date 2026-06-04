@@ -218,7 +218,9 @@ func (c *LeadTimeCalculator) Calculate(ctx context.Context, data *models.Calcula
 		}
 		component := release.Component
 		if component == "" {
-			component = release.Name // fallback when collector did not parse one
+			// Collector drops unparsable releases, but guard here too: a
+			// raw version name (e.g. "0.3") is not a component bucket.
+			continue
 		}
 		if len(data.Filters.Components) > 0 && !containsString(data.Filters.Components, component) {
 			continue
@@ -348,7 +350,9 @@ func (c *LeadTimeCalculator) calculateJiraOnlyFallback(data *models.CalculationC
 		}
 		component := release.Component
 		if component == "" {
-			component = release.Name
+			// Same guard as the PR-backed path: unparsable version names
+			// are not component buckets.
+			continue
 		}
 		if len(data.Filters.Components) > 0 && !containsString(data.Filters.Components, component) {
 			continue

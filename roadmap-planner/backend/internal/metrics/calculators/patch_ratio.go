@@ -70,7 +70,9 @@ func (c *PatchRatioCalculator) Calculate(ctx context.Context, data *models.Calcu
 
 		component := release.Component
 		if component == "" {
-			component = "unknown"
+			// Collector drops these, but guard here too: an unparsable
+			// version name is not a component bucket.
+			continue
 		}
 
 		// Apply component filter if specified

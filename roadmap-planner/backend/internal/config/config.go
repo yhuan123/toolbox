@@ -274,6 +274,22 @@ type Metrics struct {
 	Prometheus         PrometheusConfig `mapstructure:"prometheus"`
 	Filters            []OptionsConfig  `mapstructure:"filters"`
 	Calculators        []OptionsConfig  `mapstructure:"calculators"`
+	// ExcludePlugins lists component names dropped from all component
+	// dimensions (releases and issue components) during collection.
+	// Implements plan D6 — v3-era plugins (katanomi, knative, jenkins,
+	// tekton-operator) must not dilute v4 team metrics. Exact match.
+	ExcludePlugins []string `mapstructure:"exclude_plugins"`
+}
+
+// IsPluginExcluded reports whether a component name is in the
+// exclude_plugins list.
+func (c *Metrics) IsPluginExcluded(name string) bool {
+	for _, p := range c.ExcludePlugins {
+		if p == name {
+			return true
+		}
+	}
+	return false
 }
 
 // PrometheusConfig represents Prometheus exporter configuration

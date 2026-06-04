@@ -235,8 +235,52 @@ func (c *Collector) fetchReleases(ctx context.Context) ([]models.EnrichedRelease
 		c.logger.Debug("Filtered releases")
 	}
 
+	releases = c.dropInvalidComponentReleases(releases)
+
 	c.logger.Debug("Fetched releases", zap.Int("count", len(releases)), zap.Int("original", originalCount))
 	return releases, nil
+}
+
+// dropInvalidComponentReleases removes releases that must not feed any
+// component dimension: names that do not parse to component-X.Y.Z
+// (Component is empty — legacy names like "0.3", "v2.1") and components
+// in metrics.exclude_plugins (D6 — v3-era plugins). Dropping here keeps
+// every calculator clean without per-calculator filtering, and also
+// removes the releases from the versionDates maps so issues linked only
+// to invalid versions stay out of release-scoped metrics.
+func (c *Collector) dropInvalidComponentReleases(releases []models.EnrichedRelease) []models.EnrichedRelease {
+	kept := make([]models.EnrichedRelease, 0, len(releases))
+	dropped := make([]string, 0)
+	for _, r := range releases {
+		if r.Component == "" || c.config.IsPluginExcluded(r.Component) {
+			dropped = append(dropped, r.Name)
+			continue
+		}
+		kept = append(kept, r)
+	}
+	if len(dropped) > 0 {
+		c.logger.Debug("Dropped releases with invalid or excluded components",
+			zap.Int("count", len(dropped)), zap.Strings("names", dropped))
+	}
+	return kept
+}
+
+// dropExcludedComponents removes metrics.exclude_plugins entries from an
+// issue's component list (both Jira Component fields and components
+// extracted from version names) so D6 plugins disappear from issue-based
+// component dimensions (cycle_time, time_to_patch).
+func (c *Collector) dropExcludedComponents(components []string) []string {
+	if len(c.config.ExcludePlugins) == 0 || len(components) == 0 {
+		return components
+	}
+	kept := make([]string, 0, len(components))
+	for _, comp := range components {
+		if c.config.IsPluginExcluded(comp) {
+			continue
+		}
+		kept = append(kept, comp)
+	}
+	return kept
 }
 
 // enrichRelease converts a basic Version to an EnrichedRelease
@@ -281,8 +325,11 @@ func parseVersionName(name string) (component string, major, minor, patch int) {
 		return
 	}
 
-	// If no version pattern found, the whole name is the component
-	component = name
+	// No version pattern found — the name does not identify a component.
+	// Legacy names like "0.3", "v2.1" or "1.0" used to fall back to the
+	// whole name here, which polluted every per-component metric with
+	// bogus component buckets. Return empty so collectors/calculators
+	// drop the release from component dimensions.
 	return
 }
 
@@ -362,6 +409,7 @@ func (c *Collector) fetchEpics(ctx context.Context) ([]models.EnrichedIssue, err
 				}
 			}
 		}
+		enriched.Components = c.dropExcludedComponents(enriched.Components)
 
 		epics = append(epics, enriched)
 	}
@@ -431,6 +479,7 @@ func (c *Collector) fetchIssues(ctx context.Context) ([]models.EnrichedIssue, er
 				}
 			}
 		}
+		enriched.Components = c.dropExcludedComponents(enriched.Components)
 		issues = append(issues, enriched)
 	}
 

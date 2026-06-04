@@ -414,6 +414,63 @@ func TestCalculate_FallbackWhenNoPRStore(t *testing.T) {
 	}
 }
 
+// TestCalculate_SkipsEmptyComponentReleases locks in the calculator-side
+// guard for the invalid-component fix: a release whose name did not
+// parse (Component == "", e.g. legacy "0.3") must not produce a metric
+// bucket — neither under its raw name nor under "" — on both the
+// PR-backed and the Jira-only fallback paths. The collector already
+// drops such releases; this guards the in-calculator defense line
+// against a silent revert.
+func TestCalculate_SkipsEmptyComponentReleases(t *testing.T) {
+	relDate := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
+	window := models.TimeRange{
+		Start: relDate.AddDate(0, -9, 0),
+		End:   relDate.AddDate(0, 1, 0),
+	}
+	releases := []models.EnrichedRelease{
+		{ID: "v1", Name: "argo-cd-2.9.0", Component: "argo-cd", Released: true, ReleaseDate: relDate},
+		{ID: "v2", Name: "0.3", Component: "", Released: true, ReleaseDate: relDate},
+	}
+	issues := []models.EnrichedIssue{
+		{Key: "DEVOPS-1", Name: "valid", IssueType: "Story",
+			Versions:    []string{"argo-cd-2.9.0"},
+			CreatedDate: relDate.AddDate(0, 0, -10), ReleaseDate: relDate},
+		{Key: "DEVOPS-2", Name: "legacy", IssueType: "Bug",
+			Versions:    []string{"0.3"},
+			CreatedDate: relDate.AddDate(0, 0, -30), ReleaseDate: relDate},
+	}
+
+	for _, tc := range []struct {
+		name             string
+		prStoreAvailable bool
+	}{
+		{"PR-backed path", true},
+		{"Jira-only fallback path", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewLeadTimeCalculator(map[string]interface{}{"with_trend": false})
+			ctx := &models.CalculationContext{
+				Releases: releases, Issues: issues,
+				PRStoreAvailable: tc.prStoreAvailable,
+				TimeRange:        window,
+			}
+			results, err := c.Calculate(context.Background(), ctx)
+			if err != nil {
+				t.Fatalf("Calculate: %v", err)
+			}
+			for _, r := range results {
+				switch r.Labels["component"] {
+				case "argo-cd": // the valid control bucket
+				case "", "0.3":
+					t.Errorf("empty-component release leaked into bucket %q", r.Labels["component"])
+				default:
+					t.Errorf("unexpected component bucket %q", r.Labels["component"])
+				}
+			}
+		})
+	}
+}
+
 // --- end-to-end Calculate sanity check --------------------------------
 
 // TestCalculate_EndToEnd builds a tiny CalculationContext with two

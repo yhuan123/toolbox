@@ -49,6 +49,15 @@ metrics:
     path: "/metrics"
     namespace: "roadmap"         # Metric prefix: roadmap_dora_*
 
+  # Components dropped from all component dimensions (D6 — v3-era
+  # plugins must not dilute v4 team metrics). Exact component names as
+  # parsed from version names (e.g. katanomi-v3.1.0 -> katanomi).
+  exclude_plugins:
+    - katanomi
+    - knative
+    - jenkins
+    - tekton-operator
+
   filters:
     - name: "releases"
       enabled: true
